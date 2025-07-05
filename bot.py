@@ -13,51 +13,51 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from db import init_db, Session, Medicine
+from db import init_db, Session, Medicine  # Импорт базы и модели
 
-# Логирование
+# --- Настройка логирования ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка токена
+# --- Загрузка токена из файла .env ---
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     logger.error("BOT_TOKEN не найден. Убедитесь, что он в .env")
     exit(1)
 
-# Подписчики (для уведомлений, если понадобится)
+# --- Множество подписчиков для уведомлений ---
 SUBSCRIBERS = set()
 
-# Conversation states для добавления лекарства
+# --- Состояния для ConversationHandler (многошагового диалога добавления лекарства) ---
 NAME, DOSAGE, QUANTITY, EXPIRATION = range(4)
 
-# Утилита разбора аргументов (если понадобится для других команд)
+# --- Вспомогательная функция для извлечения аргументов команды ---
 def get_args(text: str):
     parts = text.split(' ', 1)
     return parts[1].strip() if len(parts) > 1 else None
 
-# Парсинг даты: YYYY-MM-DD, MM-YYYY или YYYY-MM
+# --- Функция для парсинга срока годности из разных форматов в дату ---
 def parse_expiration(exp_str: str) -> date:
     exp_str = exp_str.strip()
-    if exp_str.count('-') == 2:
+    if exp_str.count('-') == 2:  # Формат ГГГГ-ММ-ДД
         return date.fromisoformat(exp_str)
-    if exp_str.count('-') == 1:
+    if exp_str.count('-') == 1:  # Форматы ММ-ГГГГ или ГГГГ-ММ
         p1, p2 = exp_str.split('-')
-        if len(p1) == 2 and len(p2) == 4:
+        if len(p1) == 2 and len(p2) == 4:  # ММ-ГГГГ
             month, year = int(p1), int(p2)
-        elif len(p1) == 4 and len(p2) == 2:
+        elif len(p1) == 4 and len(p2) == 2:  # ГГГГ-ММ
             year, month = int(p1), int(p2)
         else:
             raise ValueError("Неверный формат даты")
-        last_day = calendar.monthrange(year, month)[1]
+        last_day = calendar.monthrange(year, month)[1]  # последний день месяца
         return date(year, month, last_day)
     raise ValueError("Неверный формат даты")
 
-# Ежедневная проверка сроков годности
+# --- Задача для ежедневной проверки лекарств с истекающим сроком ---
 async def daily_check(context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     week_later = today + timedelta(days=7)
@@ -76,12 +76,12 @@ async def daily_check(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in SUBSCRIBERS:
         await context.bot.send_message(chat_id=chat_id, text=msg)
 
-# Команда /start с кнопками
+# --- Команда /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    SUBSCRIBERS.add(chat_id)
+    SUBSCRIBERS.add(chat_id)  # Добавляем в подписчики для уведомлений
     logger.info(f"Новый подписчик: {chat_id}")
-    keyboard = [
+    keyboard = [  # Создаём клавиатуру с кнопками
         ["➕ Добавить", "📋 Список"],
         ["✏️ Редактировать", "🗑️ Удалить"],
         ["📊 Статистика", "❓ Помощь"]
@@ -92,11 +92,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-# Обработка кнопок как обычных сообщений
+# --- Обработка нажатий кнопок как текстовых сообщений ---
 async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text == "➕ Добавить":
-        return await add_start(update, context)  # Запускаем диалог вручную
+        return await add_start(update, context)  # Запускаем диалог добавления
     elif text == "📋 Список":
         await list_medicines(update, context)
     elif text == "✏️ Редактировать":
@@ -108,7 +108,8 @@ async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "❓ Помощь":
         await help_command(update, context)
 
-# Многошаговый ввод для добавления лекарства
+# --- Многошаговое добавление лекарства ---
+
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✏️ Введите название лекарства:")
     return NAME
@@ -146,7 +147,8 @@ async def add_expiration(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=context.user_data['name'],
         dosage=context.user_data['dosage'],
         quantity=context.user_data['quantity'],
-        expiration=exp_date
+        expiration=exp_date,
+        user_id=update.effective_user.id  # Привязываем лекарство к пользователю
     )
     session.add(med)
     session.commit()
@@ -162,16 +164,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Добавление отменено.")
     return ConversationHandler.END
 
-# Команды list, edit, delete, stats, help
+# --- Отобразить список лекарств пользователя ---
 async def list_medicines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = Session()
-    meds = session.query(Medicine).order_by(Medicine.id).all()
+    meds = session.query(Medicine).filter_by(user_id=update.effective_user.id).order_by(Medicine.id).all()
     session.close()
     if not meds:
         return await update.message.reply_text("🗒️ Аптечка пуста.")
     lines = [f"{m.id}. {m.name} ({m.dosage}) — {m.quantity} шт., истекает {m.expiration}" for m in meds]
     await update.message.reply_text("\n".join(lines))
 
+# --- Редактирование лекарства ---
 async def edit_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = get_args(update.message.text)
     if not args:
@@ -185,7 +188,7 @@ async def edit_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return await update.message.reply_text("❌ Неверный формат даты")
     session = Session()
-    med = session.get(Medicine, int(med_id_str))
+    med = session.query(Medicine).filter_by(id=int(med_id_str), user_id=update.effective_user.id).first()
     if not med:
         session.close()
         return await update.message.reply_text("❌ Запись не найдена")
@@ -195,12 +198,13 @@ async def edit_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session.close()
     await update.message.reply_text(f"✏️ Обновлено: {med.name} — {med.quantity} шт., истекает {med.expiration}")
 
+# --- Удаление лекарства ---
 async def delete_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = get_args(update.message.text)
     if not args or not args.isdigit():
         return await update.message.reply_text("❌ Формат: /delete ID")
     session = Session()
-    med = session.get(Medicine, int(args))
+    med = session.query(Medicine).filter_by(id=int(args), user_id=update.effective_user.id).first()
     if not med:
         session.close()
         return await update.message.reply_text("❌ Запись не найдена")
@@ -209,13 +213,14 @@ async def delete_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session.close()
     await update.message.reply_text(f"🗑️ Удалён: {med.name}")
 
+# --- Статистика лекарств ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     in_7_days = today + timedelta(days=7)
     in_30_days = today + timedelta(days=30)
 
     session = Session()
-    all_meds = session.query(Medicine).all()
+    all_meds = session.query(Medicine).filter_by(user_id=update.effective_user.id).all()
     session.close()
 
     total = len(all_meds)
@@ -232,6 +237,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
+# --- Помощь /help ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🆘 <b>Справка по командам:</b>\n\n"
@@ -246,12 +252,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
-# Запуск бота
+# --- Основной блок запуска бота ---
 if __name__ == '__main__':
-    init_db()
+    init_db()  # Создаём таблицы, если их нет
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Регистрируем хендлеры команд
+    # Регистрируем команды
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('list', list_medicines))
     app.add_handler(CommandHandler('edit', edit_medicine))
@@ -259,11 +265,11 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('stats', stats))
     app.add_handler(CommandHandler('help', help_command))
 
-    # ConversationHandler для /add (многошаговый ввод)
+    # Обработчик многошагового диалога добавления лекарства
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('add', add_start),
-            MessageHandler(filters.TEXT & filters.Regex("^➕ Добавить$"), add_start)
+            CommandHandler('add', add_start),  # Команда /add
+            MessageHandler(filters.TEXT & filters.Regex("^➕ Добавить$"), add_start)  # Кнопка "➕ Добавить"
         ],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
@@ -275,11 +281,12 @@ if __name__ == '__main__':
     )
     app.add_handler(conv_handler)
 
-    # Обработчик кнопок-клавиатуры
+    # Обработчик остальных текстовых сообщений (кнопки и команды)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_buttons))
 
-    # Планирование ежедневной проверки срока годности в 09:00
+    # Запуск ежедневной задачи проверки срока годности в 9:00 утра
     app.job_queue.run_daily(daily_check, time=dtime(hour=9, minute=0))
     logger.info("JobQueue активен, задача напоминания запланирована")
 
+    # Запуск бота (постоянный опрос Telegram)
     app.run_polling()
