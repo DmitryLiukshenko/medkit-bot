@@ -3,7 +3,7 @@ import logging
 import calendar
 from datetime import date, timedelta, time as dtime
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -82,47 +82,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(chat_id)
     logger.info(f"Новый подписчик: {chat_id}")
     keyboard = [
-        [InlineKeyboardButton("➕ Добавить лекарство", callback_data='add')],
-        [InlineKeyboardButton("📋 Показать список", callback_data='list')],
-        [InlineKeyboardButton("✏️ Редактировать", callback_data='edit')],
-        [InlineKeyboardButton("🗑️ Удалить", callback_data='delete')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='stats')],
-        [InlineKeyboardButton("❓ Помощь", callback_data='help')],
+        ["➕ Добавить", "📋 Список"],
+        ["✏️ Редактировать", "🗑️ Удалить"],
+        ["📊 Статистика", "❓ Помощь"]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        "👋 Привет! Выберите действие ниже:",
+        "👋 Привет! Я MedKitBot. Выберите действие:",
         reply_markup=reply_markup
     )
 
-# Обработчик нажатий кнопок
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == 'add':
-        await query.edit_message_text("✏️ Начинаем добавлять лекарство. Напишите /add, чтобы начать диалог.")
-    elif data == 'list':
-        session = Session()
-        meds = session.query(Medicine).order_by(Medicine.id).all()
-        session.close()
-        if not meds:
-            await query.edit_message_text("🗒️ Аптечка пуста.")
-            return
-        lines = [f"{m.id}. {m.name} ({m.dosage}) — {m.quantity} шт., истекает {m.expiration}" for m in meds]
-        await query.edit_message_text("\n".join(lines))
-    elif data == 'edit':
-        await query.edit_message_text("✏️ Чтобы изменить запись, используйте команду:\n/edit ID;кол-во;дата")
-    elif data == 'delete':
-        await query.edit_message_text("🗑️ Чтобы удалить лекарство, используйте команду:\n/delete ID")
-    elif data == 'stats':
-        await stats(query, context)
-    elif data == 'help':
-        await help_command(query, context)
+# Обработка кнопок как обычных сообщений
+async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "➕ Добавить":
+        return await add_start(update, context)  # Запускаем диалог вручную
+    elif text == "📋 Список":
+        await list_medicines(update, context)
+    elif text == "✏️ Редактировать":
+        await update.message.reply_text("✏️ Используй: /edit ID;кол-во;дата")
+    elif text == "🗑️ Удалить":
+        await update.message.reply_text("🗑️ Используй: /delete ID")
+    elif text == "📊 Статистика":
+        await stats(update, context)
+    elif text == "❓ Помощь":
+        await help_command(update, context)
 
 # Многошаговый ввод для добавления лекарства
-
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✏️ Введите название лекарства:")
     return NAME
@@ -164,20 +150,19 @@ async def add_expiration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     session.add(med)
     session.commit()
-    session.close()
 
     await update.message.reply_text(
         f"✅ Лекарство добавлено: {med.name} ({med.dosage}), "
         f"{med.quantity} шт., срок годности: {med.expiration}"
     )
+    session.close()
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Добавление отменено.")
     return ConversationHandler.END
 
-# Другие команды (list, edit, delete, stats, help) - оставляем как есть
-
+# Команды list, edit, delete, stats, help
 async def list_medicines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = Session()
     meds = session.query(Medicine).order_by(Medicine.id).all()
@@ -250,7 +235,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🆘 <b>Справка по командам:</b>\n\n"
-        "<b>/add</b> - добавить новое лекарство (можно через диалог с кнопками)\n"
+        "<b>/add</b> - добавить новое лекарство\n"
         "<b>/edit</b> ID;кол-во;дата - изменить запись по ID\n"
         "<b>/delete</b> ID - удалить лекарство по ID\n"
         "<b>/list</b> - показать все лекарства\n"
@@ -276,7 +261,10 @@ if __name__ == '__main__':
 
     # ConversationHandler для /add (многошаговый ввод)
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('add', add_start)],
+        entry_points=[
+            CommandHandler('add', add_start),
+            MessageHandler(filters.TEXT & filters.Regex("^➕ Добавить$"), add_start)
+        ],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
             DOSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_dosage)],
@@ -287,8 +275,8 @@ if __name__ == '__main__':
     )
     app.add_handler(conv_handler)
 
-    # Обработчик кнопок
-    app.add_handler(CallbackQueryHandler(button_handler))
+    # Обработчик кнопок-клавиатуры
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_buttons))
 
     # Планирование ежедневной проверки срока годности в 09:00
     app.job_queue.run_daily(daily_check, time=dtime(hour=9, minute=0))
