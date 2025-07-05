@@ -1,53 +1,52 @@
-# 📦 Импорты стандартных и сторонних библиотек
 import os
 import logging
 import calendar
 from datetime import date, timedelta, time as dtime
-
-# 📦 Загрузка переменных окружения (например, BOT_TOKEN из .env)
 from dotenv import load_dotenv
-
-# 📦 Telegram Bot API
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
-
-# 📦 Импорт функций и моделей из локального модуля БД
 from db import init_db, Session, Medicine
 
-# Логирование для отладки и мониторинга
+# Логирование
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка переменной окружения BOT_TOKEN из файла .env
+# Загрузка токена
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     logger.error("BOT_TOKEN не найден. Убедитесь, что он в .env")
     exit(1)
 
-# Временное хранилище подписчиков (chat_id)
+# Подписчики (для уведомлений, если понадобится)
 SUBSCRIBERS = set()
 
-# Разбор аргументов после команды
+# Conversation states для добавления лекарства
+NAME, DOSAGE, QUANTITY, EXPIRATION = range(4)
+
+# Утилита разбора аргументов (если понадобится для других команд)
 def get_args(text: str):
     parts = text.split(' ', 1)
     return parts[1].strip() if len(parts) > 1 else None
 
-# Парсинг даты (поддержка форматов: ГГГГ-ММ-ДД, ММ-ГГГГ и ГГГГ-ММ)
+# Парсинг даты: YYYY-MM-DD, MM-YYYY или YYYY-MM
 def parse_expiration(exp_str: str) -> date:
     exp_str = exp_str.strip()
     if exp_str.count('-') == 2:
-        return date.fromisoformat(exp_str)  # Полный формат
+        return date.fromisoformat(exp_str)
     if exp_str.count('-') == 1:
         p1, p2 = exp_str.split('-')
-        # Обработка ММ-ГГГГ и ГГГГ-ММ
         if len(p1) == 2 and len(p2) == 4:
             month, year = int(p1), int(p2)
         elif len(p1) == 4 and len(p2) == 2:
@@ -55,10 +54,10 @@ def parse_expiration(exp_str: str) -> date:
         else:
             raise ValueError("Неверный формат даты")
         last_day = calendar.monthrange(year, month)[1]
-        return date(year, month, last_day)  # Возвращаем последний день месяца
+        return date(year, month, last_day)
     raise ValueError("Неверный формат даты")
 
-# Проверка всех лекарств, срок которых истекает через 7 дней
+# Ежедневная проверка сроков годности
 async def daily_check(context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     week_later = today + timedelta(days=7)
@@ -77,47 +76,108 @@ async def daily_check(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in SUBSCRIBERS:
         await context.bot.send_message(chat_id=chat_id, text=msg)
 
-#/start — приветствие и подписка на уведомления
+# Команда /start с кнопками
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     SUBSCRIBERS.add(chat_id)
     logger.info(f"Новый подписчик: {chat_id}")
-    greeting = (
-        "👋 Привет! Я MedKitBot. Я напомню, если срок годности лекарства близок.\n"
-        "Команды:\n"
-        "/add Название;дозировка;кол-во;ГГГГ-ММ-ДД или ММ-ГГГГ\n"
-        "/list — показать все лекарства\n"
-        "/edit ID;кол-во;дата — обновить запись\n"
-        "/delete ID — удалить запись\n"
-        "/stats - вывести список моей аптечки"
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить лекарство", callback_data='add')],
+        [InlineKeyboardButton("📋 Показать список", callback_data='list')],
+        [InlineKeyboardButton("✏️ Редактировать", callback_data='edit')],
+        [InlineKeyboardButton("🗑️ Удалить", callback_data='delete')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='stats')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "👋 Привет! Выберите действие ниже:",
+        reply_markup=reply_markup
     )
-    await update.message.reply_text(greeting)
 
-#/add — добавление лекарства
-async def add_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = get_args(update.message.text)
-    if not args:
-        return await update.message.reply_text("❌ Формат: /add Название;дозировка;кол-во;дата")
-    parts = [x.strip() for x in args.split(';')]
-    if len(parts) != 4:
-        return await update.message.reply_text("❌ Формат: /add Название;дозировка;кол-во;дата")
-    name, dosage, qty_str, exp_str = parts
-    if not qty_str.isdigit():
-        return await update.message.reply_text("❌ Количество должно быть числом")
+# Обработчик нажатий кнопок
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == 'add':
+        await query.edit_message_text("✏️ Начинаем добавлять лекарство. Напишите /add, чтобы начать диалог.")
+    elif data == 'list':
+        session = Session()
+        meds = session.query(Medicine).order_by(Medicine.id).all()
+        session.close()
+        if not meds:
+            await query.edit_message_text("🗒️ Аптечка пуста.")
+            return
+        lines = [f"{m.id}. {m.name} ({m.dosage}) — {m.quantity} шт., истекает {m.expiration}" for m in meds]
+        await query.edit_message_text("\n".join(lines))
+    elif data == 'edit':
+        await query.edit_message_text("✏️ Чтобы изменить запись, используйте команду:\n/edit ID;кол-во;дата")
+    elif data == 'delete':
+        await query.edit_message_text("🗑️ Чтобы удалить лекарство, используйте команду:\n/delete ID")
+    elif data == 'stats':
+        await stats(query, context)
+    elif data == 'help':
+        await help_command(query, context)
+
+# Многошаговый ввод для добавления лекарства
+
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✏️ Введите название лекарства:")
+    return NAME
+
+async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['name'] = update.message.text.strip()
+    await update.message.reply_text("Введите дозировку (например, 500мг):")
+    return DOSAGE
+
+async def add_dosage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['dosage'] = update.message.text.strip()
+    await update.message.reply_text("Введите количество (число):")
+    return QUANTITY
+
+async def add_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    qty_text = update.message.text.strip()
+    if not qty_text.isdigit():
+        await update.message.reply_text("❌ Количество должно быть числом. Попробуйте снова:")
+        return QUANTITY
+    context.user_data['quantity'] = int(qty_text)
+    await update.message.reply_text("Введите срок годности (ГГГГ-ММ-ДД или ММ-ГГГГ):")
+    return EXPIRATION
+
+async def add_expiration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    exp_text = update.message.text.strip()
     try:
-        exp_date = parse_expiration(exp_str)
-    except ValueError:
-        return await update.message.reply_text("❌ Неверный формат даты")
+        exp_date = parse_expiration(exp_text)
+    except Exception:
+        await update.message.reply_text("❌ Неверный формат даты. Попробуйте снова:")
+        return EXPIRATION
+    context.user_data['expiration'] = exp_date
+
     session = Session()
-    med = Medicine(name=name, dosage=dosage, quantity=int(qty_str), expiration=exp_date)
+    med = Medicine(
+        name=context.user_data['name'],
+        dosage=context.user_data['dosage'],
+        quantity=context.user_data['quantity'],
+        expiration=exp_date
+    )
     session.add(med)
     session.commit()
-    await update.message.reply_text(
-        f"✅ Добавлено: {med.name} (ID {med.id}) — {med.quantity} шт., истекает {med.expiration}"
-    )
     session.close()
 
-#/list — вывод списка всех лекарств
+    await update.message.reply_text(
+        f"✅ Лекарство добавлено: {med.name} ({med.dosage}), "
+        f"{med.quantity} шт., срок годности: {med.expiration}"
+    )
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Добавление отменено.")
+    return ConversationHandler.END
+
+# Другие команды (list, edit, delete, stats, help) - оставляем как есть
+
 async def list_medicines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = Session()
     meds = session.query(Medicine).order_by(Medicine.id).all()
@@ -127,7 +187,6 @@ async def list_medicines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"{m.id}. {m.name} ({m.dosage}) — {m.quantity} шт., истекает {m.expiration}" for m in meds]
     await update.message.reply_text("\n".join(lines))
 
-#/edit — изменение количества и даты лекарства
 async def edit_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = get_args(update.message.text)
     if not args:
@@ -151,7 +210,6 @@ async def edit_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session.close()
     await update.message.reply_text(f"✏️ Обновлено: {med.name} — {med.quantity} шт., истекает {med.expiration}")
 
-#/delete - удаление записи
 async def delete_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = get_args(update.message.text)
     if not args or not args.isdigit():
@@ -166,7 +224,6 @@ async def delete_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session.close()
     await update.message.reply_text(f"🗑️ Удалён: {med.name}")
 
-#/stats - статистика по аптечке
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     in_7_days = today + timedelta(days=7)
@@ -190,22 +247,51 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
-# Запуск приложения
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🆘 <b>Справка по командам:</b>\n\n"
+        "<b>/add</b> - добавить новое лекарство (можно через диалог с кнопками)\n"
+        "<b>/edit</b> ID;кол-во;дата - изменить запись по ID\n"
+        "<b>/delete</b> ID - удалить лекарство по ID\n"
+        "<b>/list</b> - показать все лекарства\n"
+        "<b>/stats</b> - вывести статистику аптечки\n"
+        "<b>/start</b> - показать меню с кнопками\n"
+        "<b>/help</b> - показать эту справку\n"
+        "В диалоге добавления можно отменить командой /cancel"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+# Запуск бота
 if __name__ == '__main__':
-    init_db()  # Инициализация базы данных
+    init_db()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Регистрация команд
+    # Регистрируем хендлеры команд
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('add', add_medicine))
     app.add_handler(CommandHandler('list', list_medicines))
     app.add_handler(CommandHandler('edit', edit_medicine))
     app.add_handler(CommandHandler('delete', delete_medicine))
     app.add_handler(CommandHandler('stats', stats))
+    app.add_handler(CommandHandler('help', help_command))
 
-    # Планирование напоминаний ежедневно в 9:00
+    # ConversationHandler для /add (многошаговый ввод)
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('add', add_start)],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
+            DOSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_dosage)],
+            QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_quantity)],
+            EXPIRATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_expiration)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    app.add_handler(conv_handler)
+
+    # Обработчик кнопок
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Планирование ежедневной проверки срока годности в 09:00
     app.job_queue.run_daily(daily_check, time=dtime(hour=9, minute=0))
     logger.info("JobQueue активен, задача напоминания запланирована")
 
-    # Запуск бота
     app.run_polling()
