@@ -1,2 +1,4 @@
-pip install python-telegram-bot sqalchemy python-dotenv python-telegram-bot[job-queue]
-pip freeze > requirements.txt
+python-telegram-bot[job-queue]
+python-telegram-bot==20.3
+python-dotenv
+SQLAlchemy
